@@ -21,7 +21,7 @@ dependencies = [
 codex-switch = "codex_switch.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/your-org/codex-switch"
+Homepage = "https://github.com/Henry-Jessie/codex-switch"
 
 [build-system]
 requires = ["hatchling"]
