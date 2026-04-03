@@ -82,25 +82,25 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("list", help="List saved accounts with quota and token status")
 
     switch_parser = subparsers.add_parser("switch", help="Switch ~/.codex/auth.json to a saved account")
-    switch_parser.add_argument("name")
+    switch_parser.add_argument("name", help="Account name to switch to")
 
     subparsers.add_parser("current", help="Show the currently active account")
 
     quota_parser = subparsers.add_parser("quota", help="Check real-time quota for the current or a named account")
-    quota_parser.add_argument("name", nargs="?")
+    quota_parser.add_argument("name", nargs="?", help="Account name (default: current)")
 
     validate_parser = subparsers.add_parser("validate", help="Validate one account or all saved accounts")
-    validate_parser.add_argument("name", nargs="?")
+    validate_parser.add_argument("name", nargs="?", help="Account name (default: all)")
 
     save_parser = subparsers.add_parser("save", help="Save the current ~/.codex/auth.json as a named account")
-    save_parser.add_argument("name")
+    save_parser.add_argument("name", help="Name for the saved account")
 
     add_parser = subparsers.add_parser("add", help="Import an auth.json file as a named account")
-    add_parser.add_argument("path")
-    add_parser.add_argument("name")
+    add_parser.add_argument("path", help="Path to auth.json file")
+    add_parser.add_argument("name", help="Name for the imported account")
 
     remove_parser = subparsers.add_parser("remove", aliases=["rm"], help="Remove a saved account")
-    remove_parser.add_argument("name")
+    remove_parser.add_argument("name", help="Account name to remove")
 
     rename_parser = subparsers.add_parser("rename", aliases=["mv"], help="Rename a saved account")
     rename_parser.add_argument("old", help="Current account name")
