@@ -86,6 +86,7 @@ def query_account_snapshot(
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            cwd=tempdir,
         )
 
         try:
