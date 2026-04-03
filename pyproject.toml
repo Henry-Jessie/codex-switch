@@ -1,6 +1,6 @@
 [project]
 name = "codex-switch"
-version = "0.1.0"
+version = "0.1.1"
 description = "Manage multiple OpenAI Codex CLI accounts — switch, check quota, validate tokens"
 readme = "README.md"
 license = {text = "MIT"}
