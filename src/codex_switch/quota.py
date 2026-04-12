@@ -162,6 +162,80 @@ def query_account_snapshot(
     )
 
 
+def refresh_account_tokens(
+    auth_path: Path,
+    *,
+    timeout_sec: float = 30.0,
+) -> dict[str, Any]:
+    auth_path = auth_path.expanduser().resolve()
+    if not auth_path.exists():
+        raise QuotaError(f"Auth file not found: {auth_path}")
+
+    codex = shutil.which("codex")
+    if codex is None:
+        raise QuotaError("codex is not installed or not on PATH")
+
+    try:
+        from websockets.sync.client import connect
+    except ImportError as exc:
+        raise QuotaError(
+            "Python package 'websockets' is required for quota checks"
+        ) from exc
+
+    with TemporaryDirectory(prefix="codex-switch-") as tempdir:
+        codex_home = Path(tempdir) / ".codex"
+        codex_home.mkdir(parents=True, exist_ok=True)
+        temp_auth_path = codex_home / "auth.json"
+        shutil.copy2(auth_path, temp_auth_path)
+
+        port = _find_free_port()
+        env = dict(os.environ)
+        env["CODEX_HOME"] = str(codex_home)
+        proc = subprocess.Popen(
+            [
+                codex,
+                "app-server",
+                "-c",
+                'cli_auth_credentials_store="file"',
+                "--listen",
+                f"ws://127.0.0.1:{port}",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            cwd=tempdir,
+        )
+
+        try:
+            _wait_for_port(port, timeout_sec=timeout_sec)
+            with connect(
+                f"ws://127.0.0.1:{port}",
+                open_timeout=timeout_sec,
+                close_timeout=1,
+            ) as ws:
+                _send(ws, 0, "initialize", {"clientInfo": {"name": "codex-switch", "version": "0.1"}})
+                init_resp = _recv_response(ws, 0)
+                _raise_for_rpc_error(init_resp)
+                _notify(ws, "initialized", {})
+
+                _send(ws, 1, "account/read", {"refreshToken": True})
+                account_resp = _recv_response(ws, 1)
+                _raise_for_rpc_error(account_resp)
+
+            refreshed_data = _read_auth_json(temp_auth_path)
+        except Exception as exc:
+            _terminate(proc)
+            stderr = _collect_stderr(proc)
+            raise QuotaError(
+                f"Token refresh failed for {auth_path.name}: {exc}\n{stderr}".strip()
+            ) from exc
+
+        _terminate(proc)
+
+    return refreshed_data
+
+
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -244,6 +318,18 @@ def _terminate(proc: subprocess.Popen[str]) -> None:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         proc.kill()
+
+
+def _read_auth_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError as exc:
+        raise QuotaError(f"Updated auth file not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise QuotaError(f"Updated auth file is invalid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise QuotaError("Updated auth file does not contain a JSON object")
+    return data
 
 
 def _parse_rate_limit_snapshot(raw: Any) -> RateLimitSnapshot | None:

@@ -79,6 +79,26 @@ codex            -                    70% (04-03 19:52)  55% (04-10 00:34)  0   
 codex_bengalfox  GPT-5.3-Codex-Spark  0% (04-03 23:05)   0% (04-10 18:05)   -        pro
 ```
 
+### `codex-switch refresh [name]`
+
+Refresh access tokens for the current or a named account. Does not consume API quota:
+
+```bash
+$ codex-switch refresh pro1
+Refreshed pro1
+email: user1@example.com
+plan:  pro
+access token: ok (2026-04-22 06:01Z)
+id token:     ok (2026-04-12 07:01Z)
+
+Updated files:
+  /home/user/.codex-switch/pro1.json
+  /home/user/.codex/auth.json
+```
+
+- If the refreshed account is the currently active account, `~/.codex/auth.json` is also updated
+- Without a name, refreshes `~/.codex/auth.json` directly and syncs back to the matching saved account
+
 ### `codex-switch validate [name]`
 
 Check token health for one account or all saved accounts:

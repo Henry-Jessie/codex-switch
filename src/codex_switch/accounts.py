@@ -7,7 +7,12 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from .quota import refresh_account_tokens
+
+if TYPE_CHECKING:
+    from .auth import TokenInfo
 
 DATA_DIR_ENV = "CODEX_SWITCH_DATA_DIR"
 CODEX_HOME_ENV = "CODEX_SWITCH_CODEX_HOME"
@@ -138,6 +143,54 @@ def switch_account(name: str) -> Path:
     return current_auth_path()
 
 
+def refresh_account(name: str | None) -> tuple[list[Path], dict[str, Any]]:
+    from .auth import summarize_auth_data, summarize_auth_file
+
+    updated_paths: list[Path] = []
+
+    if name is not None:
+        saved = get_account(name)
+        refreshed_data = refresh_account_tokens(saved.path)
+        refreshed_info = summarize_auth_data(refreshed_data)
+
+        _write_auth_data(saved.path, refreshed_data)
+        updated_paths.append(saved.path)
+
+        live_path = current_auth_path()
+        if live_path.exists():
+            live_info = summarize_auth_file(live_path)
+            if _same_logical_account(refreshed_info, live_info):
+                _write_auth_data(live_path, refreshed_data)
+                updated_paths.append(live_path)
+
+        return updated_paths, refreshed_data
+
+    live_path = current_auth_path()
+    if not live_path.exists():
+        raise AccountError(f"Current auth file does not exist: {live_path}")
+
+    refreshed_data = refresh_account_tokens(live_path)
+    refreshed_info = summarize_auth_data(refreshed_data)
+
+    _write_auth_data(live_path, refreshed_data)
+    updated_paths.append(live_path)
+
+    matching_accounts: list[Path] = []
+    for account in list_accounts():
+        try:
+            account_info = summarize_auth_file(account.path)
+        except AccountError:
+            continue
+        if _same_logical_account(refreshed_info, account_info):
+            matching_accounts.append(account.path)
+
+    if len(matching_accounts) == 1:
+        _write_auth_data(matching_accounts[0], refreshed_data)
+        updated_paths.append(matching_accounts[0])
+
+    return updated_paths, refreshed_data
+
+
 def _sha256(path: Path) -> str | None:
     try:
         data = path.read_bytes()
@@ -192,3 +245,16 @@ def identify_current_account() -> str | None:
 
 def current_account_display_name() -> str | None:
     return identify_current_account()
+
+
+def _same_logical_account(info_a: TokenInfo, info_b: TokenInfo) -> bool:
+    if info_a.account_id and info_b.account_id:
+        return info_a.account_id == info_b.account_id
+    if info_a.email and info_b.email:
+        return info_a.email == info_b.email
+    return False
+
+
+def _write_auth_data(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")

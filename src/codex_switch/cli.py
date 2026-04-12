@@ -17,11 +17,12 @@ from .accounts import (
     identify_current_account,
     list_accounts,
     remove_account,
+    refresh_account,
     rename_account,
     save_current,
     switch_account,
 )
-from .auth import TokenInfo, format_epoch, summarize_auth_file
+from .auth import TokenInfo, format_epoch, summarize_auth_data, summarize_auth_file
 from .quota import AccountSnapshot, QuotaError, query_account_snapshot
 
 RESET = "\033[0m"
@@ -52,6 +53,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_current()
         if command == "quota":
             return cmd_quota(args.name)
+        if command == "refresh":
+            return cmd_refresh(args.name)
         if command == "validate":
             return cmd_validate(args.name)
         if command == "save":
@@ -88,6 +91,9 @@ def build_parser() -> argparse.ArgumentParser:
     quota_parser = subparsers.add_parser("quota", help="Check real-time quota for the current or a named account")
     quota_parser.add_argument("name", nargs="?", help="Account name (default: current)")
 
+    refresh_parser = subparsers.add_parser("refresh", help="Refresh tokens for the current or a named account")
+    refresh_parser.add_argument("name", nargs="?", help="Account name (default: current)")
+
     validate_parser = subparsers.add_parser("validate", help="Validate one account or all saved accounts")
     validate_parser.add_argument("name", nargs="?", help="Account name (default: all)")
 
@@ -115,32 +121,52 @@ def cmd_list() -> int:
         return 0
 
     active = identify_current_account()
-    rows: list[list[str]] = []
+
+    # Pass 1: collect static info (offline JWT parsing, fast) to compute column widths
+    static_rows: list[list[str]] = []
     for account in accounts:
         info = _safe_auth_summary(account.path)
-        live = _safe_quota(account.path)
-        if active == account.name:
-            marker = _color("*", GREEN)
-        else:
-            marker = " "
-
-        rows.append(
+        marker = "*" if active == account.name else " "
+        static_rows.append(
             [
                 marker,
                 account.name,
-                info.email or _live_email(live) or "-",
-                _live_plan(live) or info.plan_type or "-",
-                _quota_brief(live),
-                _access_exp_cell(info.access_expired, info.access_exp),
-                _live_cell(live),
+                info.email or "-",
+                info.plan_type or "-",
+                "",  # quota placeholder
+                _strip_ansi(_access_exp_cell(info.access_expired, info.access_exp)),
+                "",  # live placeholder
             ]
         )
 
+    headers = [" ", "name", "email", "plan", "quota", "access_exp", "live"]
+    min_widths = {"quota": 17, "live": 4}  # "5h:xx% / wk:xx%" = 17, "fail" = 4
+    widths = [max(len(h), min_widths.get(h, 0)) for h in headers]
+    for row in static_rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(cell))
+
     print(f"{BOLD}Saved Codex accounts{RESET}")
-    _print_table(
-        [" ", "name", "email", "plan", "quota", "access_exp", "live"],
-        rows,
-    )
+    header_line = "  ".join(headers[idx].ljust(widths[idx]) for idx in range(len(headers)))
+    print(header_line)
+    print("  ".join("-" * w for w in widths))
+
+    # Pass 2: query quota per account and print each row immediately
+    for account, static in zip(accounts, static_rows):
+        info = _safe_auth_summary(account.path)
+        live = _safe_quota(account.path)
+        marker = _color("*", GREEN) if active == account.name else " "
+        row = [
+            marker,
+            account.name,
+            info.email or _live_email(live) or "-",
+            _live_plan(live) or info.plan_type or "-",
+            _quota_brief(live),
+            _access_exp_cell(info.access_expired, info.access_exp),
+            _live_cell(live),
+        ]
+        _print_row(row, widths)
+
     return 0
 
 
@@ -196,6 +222,23 @@ def cmd_quota(name: str | None) -> int:
         _print_table(["bucket", "name", "5h", "week", "credits", "plan"], rows)
     else:
         print("No rate-limit data returned.")
+    return 0
+
+
+def cmd_refresh(name: str | None) -> int:
+    updated_paths, refreshed_data = refresh_account(name)
+    info = summarize_auth_data(refreshed_data)
+    label = name or current_account_display_name() or "current"
+
+    print(f"{BOLD}Refreshed {label}{RESET}")
+    print(f"email: {info.email or '-'}")
+    print(f"plan:  {info.plan_type or '-'}")
+    print(f"access token: {_expiry_text(info.access_expired, info.access_exp)}")
+    print(f"id token:     {_expiry_text(info.id_expired, info.id_exp)}")
+    print("")
+    print("Updated files:")
+    for path in updated_paths:
+        print(f"  {path}")
     return 0
 
 
@@ -354,6 +397,14 @@ def _expiry_text(expired: bool | None, epoch: int | None) -> str:
 
 def _color(text: str, color: str) -> str:
     return f"{color}{text}{RESET}"
+
+
+def _print_row(row: list[str], widths: list[int]) -> None:
+    plain = [_strip_ansi(cell) for cell in row]
+    print("  ".join(
+        row[idx].ljust(widths[idx] + (len(row[idx]) - len(plain[idx])))
+        for idx in range(len(row))
+    ), flush=True)
 
 
 def _print_table(headers: list[str], rows: list[list[str]]) -> None:
