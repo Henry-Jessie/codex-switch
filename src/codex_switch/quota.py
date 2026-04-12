@@ -97,19 +97,20 @@ def query_account_snapshot(
                 close_timeout=1,
             ) as ws:
                 _send(ws, 0, "initialize", {"clientInfo": {"name": "codex-switch", "version": "0.1"}})
-                init_resp = _recv(ws)
+                init_resp = _recv_response(ws, 0)
                 _raise_for_rpc_error(init_resp)
+                _notify(ws, "initialized", {})
 
                 _send(ws, 1, "account/read", {})
-                account_resp = _recv(ws)
+                account_resp = _recv_response(ws, 1)
                 _raise_for_rpc_error(account_resp)
 
                 _send(ws, 2, "getAuthStatus", {})
-                auth_resp = _recv(ws)
+                auth_resp = _recv_response(ws, 2)
                 _raise_for_rpc_error(auth_resp)
 
                 _send(ws, 3, "account/rateLimits/read", {})
-                rate_resp = _recv(ws)
+                rate_resp = _recv_response(ws, 3)
                 _raise_for_rpc_error(rate_resp)
         except Exception as exc:
             _terminate(proc)
@@ -191,12 +192,31 @@ def _send(ws: Any, request_id: int, method: str, params: dict[str, Any]) -> None
     )
 
 
-def _recv(ws: Any) -> dict[str, Any]:
-    raw = ws.recv()
-    data = json.loads(raw)
-    if not isinstance(data, dict):
-        raise QuotaError("Unexpected non-object JSON-RPC response")
-    return data
+def _notify(ws: Any, method: str, params: dict[str, Any]) -> None:
+    ws.send(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+            }
+        )
+    )
+
+
+def _recv_response(ws: Any, request_id: int) -> dict[str, Any]:
+    while True:
+        raw = ws.recv()
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise QuotaError("Unexpected non-object JSON-RPC response")
+        if "id" not in data:
+            continue
+        if data["id"] != request_id:
+            raise QuotaError(
+                f"Unexpected JSON-RPC response id: expected {request_id}, got {data['id']}"
+            )
+        return data
 
 
 def _raise_for_rpc_error(resp: dict[str, Any]) -> None:
