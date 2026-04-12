@@ -54,12 +54,11 @@ Saved Codex accounts
 
 ### `codex-switch switch <name>`
 
-Switch the active Codex CLI account. Backs up current `~/.codex/auth.json` automatically:
+Switch the active Codex CLI account:
 
 ```bash
 $ codex-switch switch pro2
 Switched to account 'pro2'
-Backup: /home/user/.codex-switch/backups/auth-20260403-143022.json
 Active auth: /home/user/.codex/auth.json
 ```
 
@@ -159,9 +158,6 @@ Quota checking starts a temporary `codex app-server` process pointed at the targ
 ~/.codex-switch/
 ├── pro1.json        # saved auth.json for "pro1"
 ├── pro2.json        # saved auth.json for "pro2"
-├── backups/         # automatic backups on switch
-│   └── auth-20260403-143022.json
-└── .current         # name of the last switched account
 ```
 
 ## Environment variables

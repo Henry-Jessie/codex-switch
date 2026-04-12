@@ -16,7 +16,6 @@ from .accounts import (
     get_account,
     identify_current_account,
     list_accounts,
-    read_current_name,
     remove_account,
     rename_account,
     save_current,
@@ -116,16 +115,12 @@ def cmd_list() -> int:
         return 0
 
     active = identify_current_account()
-    fallback_active = read_current_name()
     rows: list[list[str]] = []
     for account in accounts:
         info = _safe_auth_summary(account.path)
         live = _safe_quota(account.path)
-        marker = "*"
         if active == account.name:
             marker = _color("*", GREEN)
-        elif fallback_active == account.name:
-            marker = _color("~", YELLOW)
         else:
             marker = " "
 
@@ -146,15 +141,12 @@ def cmd_list() -> int:
         [" ", "name", "email", "plan", "quota", "access_exp", "live"],
         rows,
     )
-    print("\nLegend: * exact current auth, ~ last switched name from .current")
     return 0
 
 
 def cmd_switch(name: str) -> int:
-    backup, dst = switch_account(name)
+    dst = switch_account(name)
     print(_color(f"Switched to account '{name}'", GREEN))
-    if backup is not None:
-        print(f"Backup: {backup}")
     print(f"Active auth: {dst}")
     return 0
 

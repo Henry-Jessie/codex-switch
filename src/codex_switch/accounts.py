@@ -6,7 +6,6 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +14,6 @@ CODEX_HOME_ENV = "CODEX_SWITCH_CODEX_HOME"
 
 DEFAULT_DATA_DIR = Path.home() / ".codex-switch"
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
-CURRENT_FILENAME = ".current"
 
 
 class AccountError(RuntimeError):
@@ -38,10 +36,6 @@ def codex_home_dir() -> Path:
 
 def current_auth_path() -> Path:
     return codex_home_dir() / "auth.json"
-
-
-def state_path() -> Path:
-    return data_dir() / CURRENT_FILENAME
 
 
 def _normalize_name(name: str) -> str:
@@ -113,8 +107,6 @@ def rename_account(old_name: str, new_name: str) -> Path:
     if dst.exists():
         raise AccountError(f"Account '{new_name}' already exists")
     acct.path.rename(dst)
-    if read_current_name() == old_name:
-        write_current_name(new_name)
     return dst
 
 
@@ -125,8 +117,7 @@ def save_current(name: str) -> Path:
     raw = load_auth_file(src)
     _validate_auth_shape(raw, src)
     dst = account_path(name)
-    dst.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
-    write_current_name(dst.stem)
+    shutil.copy2(src, dst)
     return dst
 
 
@@ -139,42 +130,12 @@ def add_account(source: Path, name: str) -> Path:
     return dst
 
 
-def _backup_dir() -> Path:
-    root = data_dir() / "backups"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-
-def backup_current() -> Path | None:
-    src = current_auth_path()
-    if not src.exists():
-        return None
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    dst = _backup_dir() / f"auth-{timestamp}.json"
-    shutil.copy2(src, dst)
-    return dst
-
-
-def switch_account(name: str) -> tuple[Path | None, Path]:
+def switch_account(name: str) -> Path:
     acct = get_account(name)
-    backup = backup_current()
     dst_dir = codex_home_dir()
     dst_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(acct.path, current_auth_path())
-    write_current_name(acct.name)
-    return backup, current_auth_path()
-
-
-def read_current_name() -> str | None:
-    path = state_path()
-    if not path.exists():
-        return None
-    text = path.read_text().strip()
-    return text or None
-
-
-def write_current_name(name: str) -> None:
-    state_path().write_text(f"{_normalize_name(name)}\n")
+    return current_auth_path()
 
 
 def _sha256(path: Path) -> str | None:
@@ -189,17 +150,45 @@ def identify_current_account() -> str | None:
     current_hash = _sha256(current_auth_path())
     if current_hash is None:
         return None
-    for account in list_accounts():
+
+    accounts = list_accounts()
+    for account in accounts:
         if _sha256(account.path) == current_hash:
             return account.name
+
+    from .auth import summarize_auth_file
+
+    try:
+        current_info = summarize_auth_file(current_auth_path())
+    except AccountError:
+        return None
+
+    if current_info.account_id:
+        account_id_matches: list[str] = []
+        for account in accounts:
+            try:
+                info = summarize_auth_file(account.path)
+            except AccountError:
+                continue
+            if info.account_id == current_info.account_id:
+                account_id_matches.append(account.name)
+        if len(account_id_matches) == 1:
+            return account_id_matches[0]
+
+    if current_info.email:
+        email_matches: list[str] = []
+        for account in accounts:
+            try:
+                info = summarize_auth_file(account.path)
+            except AccountError:
+                continue
+            if info.email == current_info.email:
+                email_matches.append(account.name)
+        if len(email_matches) == 1:
+            return email_matches[0]
+
     return None
 
 
 def current_account_display_name() -> str | None:
-    matched = identify_current_account()
-    if matched:
-        return matched
-    stored = read_current_name()
-    if stored and account_path(stored).exists():
-        return stored
-    return None
+    return identify_current_account()
