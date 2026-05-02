@@ -10,6 +10,7 @@ from . import __version__
 from .accounts import (
     AccountError,
     add_account,
+    account_path,
     current_account_display_name,
     current_auth_path,
     ensure_storage,
@@ -23,7 +24,7 @@ from .accounts import (
     switch_account,
 )
 from .auth import TokenInfo, format_epoch, summarize_auth_data, summarize_auth_file
-from .quota import AccountSnapshot, QuotaError, query_account_snapshot
+from .quota import AccountSnapshot, QuotaError, probe_account_usage, query_account_snapshot
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -55,15 +56,17 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_quota(args.name)
         if command == "refresh":
             return cmd_refresh(args.name)
+        if command == "probe":
+            return cmd_probe(args.name, args.model)
         if command == "validate":
             return cmd_validate(args.name)
         if command == "save":
             return cmd_save(args.name)
         if command == "add":
             return cmd_add(args.path, args.name)
-        if command == "remove":
+        if command in ("remove", "rm"):
             return cmd_remove(args.name)
-        if command == "rename":
+        if command in ("rename", "mv"):
             return cmd_rename(args.old, args.new)
     except (AccountError, QuotaError) as exc:
         print(_color(f"Error: {exc}", RED), file=sys.stderr)
@@ -93,6 +96,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     refresh_parser = subparsers.add_parser("refresh", help="Refresh tokens for the current or a named account")
     refresh_parser.add_argument("name", nargs="?", help="Account name (default: current)")
+
+    probe_parser = subparsers.add_parser("probe", help="Run a tiny Codex request to start the quota timer")
+    probe_parser.add_argument("name", nargs="?", help="Account name (default: current)")
+    probe_parser.add_argument("--model", help="Model to probe with (default: Codex CLI default)")
 
     validate_parser = subparsers.add_parser("validate", help="Validate one account or all saved accounts")
     validate_parser.add_argument("name", nargs="?", help="Account name (default: all)")
@@ -131,16 +138,16 @@ def cmd_list() -> int:
             [
                 marker,
                 account.name,
-                info.email or "-",
-                info.plan_type or "-",
+                _auth_email(info),
+                _auth_plan(info),
                 "",  # quota placeholder
-                _strip_ansi(_access_exp_cell(info.access_expired, info.access_exp)),
+                _strip_ansi(_auth_access_exp_cell(info)),
                 "",  # live placeholder
             ]
         )
 
     headers = [" ", "name", "email", "plan", "quota", "access_exp", "live"]
-    min_widths = {"quota": 17, "live": 4}  # "5h:xx% / wk:xx%" = 17, "fail" = 4
+    min_widths = {"quota": 43, "live": 4}  # "5h:xx% (MM-DD HH:MM) / wk:xx% (MM-DD HH:MM)"
     widths = [max(len(h), min_widths.get(h, 0)) for h in headers]
     for row in static_rows:
         for idx, cell in enumerate(row):
@@ -159,10 +166,10 @@ def cmd_list() -> int:
         row = [
             marker,
             account.name,
-            info.email or _live_email(live) or "-",
-            _live_plan(live) or info.plan_type or "-",
+            _auth_email(info, live),
+            _live_plan(live) or _auth_plan(info),
             _quota_brief(live),
-            _access_exp_cell(info.access_expired, info.access_exp),
+            _auth_access_exp_cell(info),
             _live_cell(live),
         ]
         _print_row(row, widths)
@@ -242,6 +249,26 @@ def cmd_refresh(name: str | None) -> int:
     return 0
 
 
+def cmd_probe(name: str | None, model: str | None) -> int:
+    target_name, auth_path = _resolve_target(name)
+    print(f"{BOLD}Probing {target_name}{RESET}")
+    print(f"auth:  {auth_path}")
+    print(f"model: {model or 'Codex CLI default'}")
+    result = probe_account_usage(auth_path, model=model)
+    print(_color("Probe completed", GREEN))
+    if result.stdout:
+        print(f"reply: {result.stdout}")
+
+    live = _safe_quota(auth_path)
+    if isinstance(live, Exception):
+        print(f"quota: {_color(str(live), RED)}")
+    else:
+        print(f"email: {_live_email(live) or '-'}")
+        print(f"plan:  {_live_plan(live) or '-'}")
+        print(f"quota: {_quota_brief(live)}")
+    return 0
+
+
 def cmd_validate(name: str | None) -> int:
     if name:
         targets = [get_account(name)]
@@ -252,11 +279,20 @@ def cmd_validate(name: str | None) -> int:
             return 0
 
     for index, account in enumerate(targets):
-        info = summarize_auth_file(account.path)
+        info = _safe_auth_summary(account.path)
         live = _safe_quota(account.path)
         if index:
             print("")
         print(f"{BOLD}{account.name}{RESET}")
+        if isinstance(info, Exception):
+            print(f"  auth:    {_color(str(info), RED)}")
+            if isinstance(live, Exception):
+                print(f"  live:    {_color(str(live), RED)}")
+            else:
+                print(f"  email:   {_live_email(live) or '-'}")
+                print(f"  plan:    {_live_plan(live) or '-'}")
+                print(f"  live:    {_color('OK', GREEN)} {_quota_brief(live)}")
+            continue
         print(f"  email:   {info.email or _live_email(live) or '-'}")
         print(f"  plan:    {_live_plan(live) or info.plan_type or '-'}")
         print(f"  access:  {_expiry_text(info.access_expired, info.access_exp)}")
@@ -270,14 +306,20 @@ def cmd_validate(name: str | None) -> int:
 
 
 def cmd_save(name: str) -> int:
+    will_overwrite = account_path(name).exists()
     dst = save_current(name)
+    if will_overwrite:
+        print(_color(f"Warning: overwrote existing account '{dst.stem}'", YELLOW))
     print(_color(f"Saved current auth as '{dst.stem}'", GREEN))
     print(dst)
     return 0
 
 
 def cmd_add(path: str, name: str) -> int:
+    will_overwrite = account_path(name).exists()
     dst = add_account(Path(path), name)
+    if will_overwrite:
+        print(_color(f"Warning: overwrote existing account '{dst.stem}'", YELLOW))
     print(_color(f"Imported account '{dst.stem}'", GREEN))
     print(dst)
     return 0
@@ -308,8 +350,11 @@ def _resolve_target(name: str | None) -> tuple[str, Path]:
     return current_account_display_name() or "current", path
 
 
-def _safe_auth_summary(path: Path) -> TokenInfo:
-    return summarize_auth_file(path)
+def _safe_auth_summary(path: Path) -> TokenInfo | Exception:
+    try:
+        return summarize_auth_file(path)
+    except Exception as exc:
+        return exc
 
 
 def _safe_quota(path: Path) -> AccountSnapshot | Exception:
@@ -327,13 +372,31 @@ def _live_plan(snapshot: AccountSnapshot | Exception) -> str | None:
     return snapshot.plan_type if isinstance(snapshot, AccountSnapshot) else None
 
 
+def _auth_email(info: TokenInfo | Exception, live: AccountSnapshot | Exception | None = None) -> str:
+    if isinstance(info, TokenInfo):
+        return info.email or _live_email(live) or "-"
+    return _live_email(live) or "-"
+
+
+def _auth_plan(info: TokenInfo | Exception) -> str:
+    if isinstance(info, TokenInfo):
+        return info.plan_type or "-"
+    return "-"
+
+
+def _auth_access_exp_cell(info: TokenInfo | Exception) -> str:
+    if isinstance(info, TokenInfo):
+        return _access_exp_cell(info.access_expired, info.access_exp)
+    return "-"
+
+
 def _quota_brief(snapshot: AccountSnapshot | Exception) -> str:
     if not isinstance(snapshot, AccountSnapshot):
         return _color("ERR", RED)
     quota = snapshot.default_rate_limit
     if quota is None:
         return "-"
-    return f"5h:{_window_pct(quota.primary)} / wk:{_window_pct(quota.secondary)}"
+    return f"5h:{_window_brief(quota.primary)} / wk:{_window_brief(quota.secondary)}"
 
 
 def _window_pct(window: Any) -> str:

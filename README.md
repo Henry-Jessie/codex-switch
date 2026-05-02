@@ -40,15 +40,15 @@ Show all saved accounts with plan, quota, token expiry, and live API status:
 
 ```
 Saved Codex accounts
-   name      email                         plan  quota            access_exp   live
--  --------  ----------------------------  ----  ---------------  -----------  ----
-*  pro1      user1@example.com             pro   5h:69% / wk:55%  04-10 10:48  ok
-   pro2      user2@example.com             pro   5h:0% / wk:6%    04-13 16:27  ok
-   personal  user3@gmail.com               pro   5h:0% / wk:0%    04-13 16:18  ok
+   name      email                         plan  quota                                         access_exp   live
+-  --------  ----------------------------  ----  --------------------------------------------  -----------  ----
+*  pro1      user1@example.com             pro   5h:69% (04-03 19:52) / wk:55% (04-10 00:34)  04-10 10:48  ok
+   pro2      user2@example.com             pro   5h:0% (04-03 23:05) / wk:6% (04-10 18:05)    04-13 16:27  ok
+   personal  user3@gmail.com               pro   5h:0% (04-03 23:05) / wk:0% (04-10 18:05)    04-13 16:18  ok
 ```
 
 - `*` = currently active account (matches `~/.codex/auth.json`)
-- `5h` = 5-hour rolling window usage, `wk` = 7-day rolling window usage
+- `5h` = 5-hour rolling window usage and reset time, `wk` = 7-day rolling window usage and reset time
 - `access_exp` = when the access token expires (local time)
 - `live` = real-time API validation result
 
@@ -98,6 +98,30 @@ Updated files:
 
 - If the refreshed account is the currently active account, `~/.codex/auth.json` is also updated
 - Without a name, refreshes `~/.codex/auth.json` directly and syncs back to the matching saved account
+
+### `codex-switch probe [name]`
+
+Run a tiny Codex request for the current or a named account. This is useful when you want to start the account's rolling quota window before checking `list` or `quota`.
+
+```bash
+$ codex-switch probe pro1
+Probing pro1
+auth:  /home/user/.codex-switch/pro1.json
+model: Codex CLI default
+Probe completed
+reply: OK
+email: user1@example.com
+plan:  pro
+quota: 5h:1% (04-03 19:52) / wk:1% (04-10 00:34)
+```
+
+Use `--model` when you need to start usage for a specific model bucket:
+
+```bash
+codex-switch probe pro1 --model gpt-5.1-codex
+```
+
+Unlike `quota`, this command sends one real Codex request and can consume a small amount of quota. It uses a temporary `CODEX_HOME`, so it does not switch or rewrite your active `~/.codex/auth.json`.
 
 ### `codex-switch validate [name]`
 

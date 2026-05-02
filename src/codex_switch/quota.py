@@ -11,8 +11,19 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
+from . import __version__
+
+
 class QuotaError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    auth_path: Path
+    model: str | None
+    stdout: str
+    stderr: str
 
 
 @dataclass(frozen=True)
@@ -96,7 +107,7 @@ def query_account_snapshot(
                 open_timeout=timeout_sec,
                 close_timeout=1,
             ) as ws:
-                _send(ws, 0, "initialize", {"clientInfo": {"name": "codex-switch", "version": "0.1"}})
+                _send(ws, 0, "initialize", {"clientInfo": {"name": "codex-switch", "version": __version__}})
                 init_resp = _recv_response(ws, 0)
                 _raise_for_rpc_error(init_resp)
                 _notify(ws, "initialized", {})
@@ -214,7 +225,7 @@ def refresh_account_tokens(
                 open_timeout=timeout_sec,
                 close_timeout=1,
             ) as ws:
-                _send(ws, 0, "initialize", {"clientInfo": {"name": "codex-switch", "version": "0.1"}})
+                _send(ws, 0, "initialize", {"clientInfo": {"name": "codex-switch", "version": __version__}})
                 init_resp = _recv_response(ws, 0)
                 _raise_for_rpc_error(init_resp)
                 _notify(ws, "initialized", {})
@@ -234,6 +245,74 @@ def refresh_account_tokens(
         _terminate(proc)
 
     return refreshed_data
+
+
+def probe_account_usage(
+    auth_path: Path,
+    *,
+    model: str | None = None,
+    timeout_sec: float = 120.0,
+) -> ProbeResult:
+    auth_path = auth_path.expanduser().resolve()
+    if not auth_path.exists():
+        raise QuotaError(f"Auth file not found: {auth_path}")
+
+    codex = shutil.which("codex")
+    if codex is None:
+        raise QuotaError("codex is not installed or not on PATH")
+
+    with TemporaryDirectory(prefix="codex-switch-") as tempdir:
+        temp_root = Path(tempdir)
+        codex_home = temp_root / ".codex"
+        workdir = temp_root / "work"
+        codex_home.mkdir(parents=True, exist_ok=True)
+        workdir.mkdir()
+        shutil.copy2(auth_path, codex_home / "auth.json")
+
+        command = [
+            codex,
+            "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--sandbox",
+            "read-only",
+            "-C",
+            str(workdir),
+        ]
+        if model:
+            command.extend(["--model", model])
+        command.append("Reply with exactly OK.")
+
+        env = dict(os.environ)
+        env["CODEX_HOME"] = str(codex_home)
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=workdir,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise QuotaError(f"Probe timed out after {timeout_sec:.0f}s") from exc
+
+    if completed.returncode != 0:
+        raise QuotaError(
+            f"Probe failed for {auth_path.name} with exit code {completed.returncode}\n"
+            f"{completed.stderr.strip()}".strip()
+        )
+
+    return ProbeResult(
+        auth_path=auth_path,
+        model=model,
+        stdout=completed.stdout.strip(),
+        stderr=completed.stderr.strip(),
+    )
 
 
 def _find_free_port() -> int:
