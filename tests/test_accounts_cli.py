@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -15,17 +16,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from codex_switch import accounts, cli
 from codex_switch import quota
+from codex_switch.auth import format_epoch
 from codex_switch.quota import AccountSnapshot, ProbeResult, RateLimitSnapshot, RateLimitWindow
 
 
-def auth_data(refresh_token: str) -> dict[str, object]:
-    return {
-        "tokens": {
-            "access_token": "access",
-            "id_token": "id",
-            "refresh_token": refresh_token,
-        }
+def auth_data(refresh_token: str, account_id: str | None = None) -> dict[str, object]:
+    tokens: dict[str, object] = {
+        "access_token": "access",
+        "id_token": "id",
+        "refresh_token": refresh_token,
     }
+    if account_id is not None:
+        tokens["account_id"] = account_id
+    return {"tokens": tokens}
 
 
 def quota_snapshot(path: Path) -> AccountSnapshot:
@@ -162,6 +165,240 @@ class AccountStorageTests(unittest.TestCase):
         self.assertIn("reply: OK", text)
         self.assertIn("quota: 5h:12% (", text)
 
+    def test_switch_syncs_current_live_auth_to_saved_profile(self) -> None:
+        (self.data_dir / "alpha.json").write_text(
+            json.dumps(auth_data("refresh-a", account_id="acc-1")) + "\n"
+        )
+        (self.data_dir / "beta.json").write_text(
+            json.dumps(auth_data("refresh-b", account_id="acc-2")) + "\n"
+        )
+
+        accounts.switch_account("alpha")
+
+        live = accounts.current_auth_path()
+        live.write_text(
+            json.dumps(auth_data("refresh-a-rotated", account_id="acc-1")) + "\n"
+        )
+
+        accounts.switch_account("beta")
+
+        alpha_saved = accounts.load_auth_file(accounts.account_path("alpha"))
+        self.assertEqual(alpha_saved["tokens"]["refresh_token"], "refresh-a-rotated")
+
+        live_data = accounts.load_auth_file(live)
+        self.assertEqual(live_data["tokens"]["refresh_token"], "refresh-b")
+
+    def test_switch_to_same_account_does_not_corrupt_saved_profile(self) -> None:
+        (self.data_dir / "alpha.json").write_text(
+            json.dumps(auth_data("refresh-a", account_id="acc-1")) + "\n"
+        )
+        accounts.switch_account("alpha")
+
+        live = accounts.current_auth_path()
+        live.write_text(
+            json.dumps(auth_data("refresh-a-rotated", account_id="acc-1")) + "\n"
+        )
+
+        accounts.switch_account("alpha")
+
+        live_data = accounts.load_auth_file(live)
+        self.assertEqual(live_data["tokens"]["refresh_token"], "refresh-a-rotated")
+
+    def test_list_uses_live_file_for_active_account(self) -> None:
+        (self.data_dir / "work.json").write_text(
+            json.dumps(auth_data("saved-refresh", account_id="acc-1")) + "\n"
+        )
+
+        live = accounts.current_auth_path()
+        live.write_text(
+            json.dumps(auth_data("live-refresh", account_id="acc-1")) + "\n"
+        )
+
+        with mock.patch.object(
+            cli, "query_account_snapshot", side_effect=lambda p: quota_snapshot(p)
+        ) as query:
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = cli.cmd_list()
+
+        self.assertEqual(result, 0)
+        called_paths = [call.args[0].resolve() for call in query.call_args_list]
+        self.assertIn(live.resolve(), called_paths)
+
+    def _fake_codex_login(self, refresh_token: str, account_id: str = "acc-new"):
+        """Return a side_effect that writes auth.json to CODEX_HOME."""
+        def _impl(args, env, check):
+            codex_home = Path(env["CODEX_HOME"])
+            (codex_home / "auth.json").write_text(
+                json.dumps(auth_data(refresh_token, account_id=account_id)) + "\n"
+            )
+            return subprocess.CompletedProcess(args=args, returncode=0)
+        return _impl
+
+    def test_login_saves_profile(self) -> None:
+        with (
+            mock.patch.object(accounts.shutil, "which", return_value="/usr/bin/codex"),
+            mock.patch.object(accounts.subprocess, "run", side_effect=self._fake_codex_login("new-rt")),
+        ):
+            dst, overwritten = accounts.login_account("work")
+
+        self.assertFalse(overwritten)
+        saved = accounts.load_auth_file(dst)
+        self.assertEqual(saved["tokens"]["refresh_token"], "new-rt")
+
+    def test_login_with_device_auth_passes_flag(self) -> None:
+        with (
+            mock.patch.object(accounts.shutil, "which", return_value="/usr/bin/codex"),
+            mock.patch.object(
+                accounts.subprocess, "run", side_effect=self._fake_codex_login("dev-rt")
+            ) as run,
+        ):
+            accounts.login_account("dev", device_auth=True)
+
+        command = run.call_args.args[0]
+        self.assertIn("--device-auth", command)
+
+    def test_login_switch_activates_account(self) -> None:
+        with (
+            mock.patch.object(accounts.shutil, "which", return_value="/usr/bin/codex"),
+            mock.patch.object(
+                accounts.subprocess, "run", side_effect=self._fake_codex_login("sw-rt", "acc-sw")
+            ),
+        ):
+            accounts.login_account("newbie", switch=True)
+
+        live = accounts.load_auth_file(accounts.current_auth_path())
+        self.assertEqual(live["tokens"]["refresh_token"], "sw-rt")
+        self.assertEqual(accounts.identify_current_account(), "newbie")
+
+    def test_login_overwrites_existing_profile(self) -> None:
+        (self.data_dir / "work.json").write_text(
+            json.dumps(auth_data("old-rt", account_id="acc-old")) + "\n"
+        )
+        with (
+            mock.patch.object(accounts.shutil, "which", return_value="/usr/bin/codex"),
+            mock.patch.object(
+                accounts.subprocess, "run", side_effect=self._fake_codex_login("new-rt", "acc-new")
+            ),
+        ):
+            dst, overwritten = accounts.login_account("work")
+
+        self.assertTrue(overwritten)
+        saved = accounts.load_auth_file(dst)
+        self.assertEqual(saved["tokens"]["refresh_token"], "new-rt")
+
+    def test_login_does_not_disturb_current_active_account(self) -> None:
+        live = accounts.current_auth_path()
+        self.write_auth(live, "current-rt")
+        with (
+            mock.patch.object(accounts.shutil, "which", return_value="/usr/bin/codex"),
+            mock.patch.object(
+                accounts.subprocess, "run", side_effect=self._fake_codex_login("new-rt", "acc-new")
+            ),
+        ):
+            accounts.login_account("extra")
+
+        live_data = accounts.load_auth_file(live)
+        self.assertEqual(live_data["tokens"]["refresh_token"], "current-rt")
+
+    def test_login_fails_when_codex_not_installed(self) -> None:
+        with mock.patch.object(accounts.shutil, "which", return_value=None):
+            with self.assertRaises(accounts.AccountError):
+                accounts.login_account("work")
+
+    def test_login_fails_when_codex_login_exits_nonzero(self) -> None:
+        def fail(args, env, check):
+            raise subprocess.CalledProcessError(1, args)
+
+        with (
+            mock.patch.object(accounts.shutil, "which", return_value="/usr/bin/codex"),
+            mock.patch.object(accounts.subprocess, "run", side_effect=fail),
+        ):
+            with self.assertRaises(accounts.AccountError):
+                accounts.login_account("work")
+
+    def test_login_without_name_uses_current_account_name(self) -> None:
+        (self.data_dir / "default.json").write_text(
+            json.dumps(auth_data("old-rt", account_id="acc-1")) + "\n"
+        )
+        live = accounts.current_auth_path()
+        self.write_auth(live, "old-rt")
+
+        with (
+            mock.patch.object(accounts.shutil, "which", return_value="/usr/bin/codex"),
+            mock.patch.object(
+                accounts.subprocess, "run", side_effect=self._fake_codex_login("new-rt", "acc-1")
+            ),
+        ):
+            dst, overwritten = accounts.login_account()
+
+        self.assertEqual(dst.stem, "default")
+        self.assertTrue(overwritten)
+        saved = accounts.load_auth_file(dst)
+        self.assertEqual(saved["tokens"]["refresh_token"], "new-rt")
+
+    def test_login_without_name_defaults_to_default_when_no_active(self) -> None:
+        with (
+            mock.patch.object(accounts.shutil, "which", return_value="/usr/bin/codex"),
+            mock.patch.object(
+                accounts.subprocess, "run", side_effect=self._fake_codex_login("fresh-rt", "acc-x")
+            ),
+        ):
+            dst, overwritten = accounts.login_account()
+
+        self.assertEqual(dst.stem, "default")
+        self.assertFalse(overwritten)
+
+    def test_login_without_name_switch_replaces_current(self) -> None:
+        (self.data_dir / "default.json").write_text(
+            json.dumps(auth_data("old-rt", account_id="acc-1")) + "\n"
+        )
+        live = accounts.current_auth_path()
+        self.write_auth(live, "old-rt")
+
+        with (
+            mock.patch.object(accounts.shutil, "which", return_value="/usr/bin/codex"),
+            mock.patch.object(
+                accounts.subprocess, "run", side_effect=self._fake_codex_login("new-rt", "acc-1")
+            ),
+        ):
+            accounts.login_account(switch=True)
+
+        live_data = accounts.load_auth_file(live)
+        self.assertEqual(live_data["tokens"]["refresh_token"], "new-rt")
+
+    def test_login_includes_file_credential_config(self) -> None:
+        with (
+            mock.patch.object(accounts.shutil, "which", return_value="/usr/bin/codex"),
+            mock.patch.object(
+                accounts.subprocess, "run", side_effect=self._fake_codex_login("rt", "acc-1")
+            ) as run,
+        ):
+            accounts.login_account("work")
+
+        command = run.call_args.args[0]
+        self.assertIn("-c", command)
+        idx = command.index("-c")
+        self.assertEqual(command[idx + 1], 'cli_auth_credentials_store="file"')
+
+    def test_login_normalizes_name_before_switch_comparison(self) -> None:
+        (self.data_dir / "work.json").write_text(
+            json.dumps(auth_data("old-rt", account_id="acc-1")) + "\n"
+        )
+        live = accounts.current_auth_path()
+        self.write_auth(live, "old-rt")
+
+        with (
+            mock.patch.object(accounts.shutil, "which", return_value="/usr/bin/codex"),
+            mock.patch.object(
+                accounts.subprocess, "run", side_effect=self._fake_codex_login("new-rt", "acc-1")
+            ),
+        ):
+            accounts.login_account(" work ", switch=True)
+
+        live_data = accounts.load_auth_file(live)
+        self.assertEqual(live_data["tokens"]["refresh_token"], "new-rt")
+
 
 class CliBadAccountTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -227,6 +464,44 @@ class CliBadAccountTests(unittest.TestCase):
         self.assertIn("Invalid JSON", text)
         self.assertIn("good", text)
         self.assertEqual(query.call_count, 2)
+
+    def test_validate_named_active_account_uses_live_file(self) -> None:
+        live = accounts.current_auth_path()
+        saved_data = auth_data("saved-refresh", account_id="acc-1")
+        (self.data_dir / "good.json").write_text(json.dumps(saved_data) + "\n")
+        live_data = auth_data("live-refresh", account_id="acc-1")
+        live.write_text(json.dumps(live_data) + "\n")
+
+        with mock.patch.object(
+            cli, "query_account_snapshot", side_effect=lambda p: quota_snapshot(p)
+        ) as query:
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = cli.cmd_validate("good")
+
+        self.assertEqual(result, 0)
+        called_path = query.call_args.args[0].resolve()
+        self.assertEqual(called_path, live.resolve())
+
+
+class TimestampFormatTests(unittest.TestCase):
+    def test_access_exp_cell_uses_utc(self) -> None:
+        epoch = 1783494110
+        expected = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%m-%d %H:%M")
+        result = cli._strip_ansi(cli._access_exp_cell(False, epoch))
+        self.assertEqual(result, expected)
+
+    def test_format_reset_uses_utc(self) -> None:
+        epoch = 1783494110
+        expected = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%m-%d %H:%M")
+        self.assertEqual(cli._format_reset(epoch), expected)
+
+    def test_timestamps_consistent_with_format_epoch(self) -> None:
+        epoch = 1783494110
+        utc_str = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%m-%d %H:%M")
+        self.assertIn(utc_str, format_epoch(epoch))
+        self.assertEqual(cli._strip_ansi(cli._access_exp_cell(False, epoch)), utc_str)
+        self.assertEqual(cli._format_reset(epoch), utc_str)
 
 
 class ProbeCommandTests(unittest.TestCase):

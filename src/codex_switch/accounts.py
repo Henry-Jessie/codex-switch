@@ -5,8 +5,10 @@ import json
 import os
 import re
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any
 
 from .quota import refresh_account_tokens
@@ -135,12 +137,95 @@ def add_account(source: Path, name: str) -> Path:
     return dst
 
 
+def login_account(
+    name: str | None = None, *, device_auth: bool = False, switch: bool = False
+) -> tuple[Path, bool]:
+    """Log in via Codex CLI OAuth and save as a named account.
+
+    Runs ``codex login`` inside a temporary ``CODEX_HOME`` so the current
+    active account in ``~/.codex/auth.json`` is not disturbed.  The resulting
+    ``auth.json`` is validated and saved to the profile store.
+
+    If *name* is ``None`` the current account's display name is used (or
+    ``"default"`` when no active account is identified), making
+    ``codex-switch login`` a convenient re-login for the current account.
+
+    Returns ``(destination_path, overwritten)``.
+    """
+    codex = shutil.which("codex")
+    if codex is None:
+        raise AccountError("codex is not installed or not on PATH")
+
+    with TemporaryDirectory(prefix="codex-switch-login-") as tempdir:
+        codex_home = Path(tempdir) / ".codex"
+        codex_home.mkdir(parents=True, exist_ok=True)
+
+        env = dict(os.environ)
+        env["CODEX_HOME"] = str(codex_home)
+
+        command = [codex, "login", "-c", 'cli_auth_credentials_store="file"']
+        if device_auth:
+            command.append("--device-auth")
+
+        try:
+            subprocess.run(command, env=env, check=True)
+        except subprocess.CalledProcessError as exc:
+            raise AccountError(
+                f"codex login failed with exit code {exc.returncode}"
+            ) from exc
+
+        temp_auth = codex_home / "auth.json"
+        if not temp_auth.exists():
+            raise AccountError("Login did not produce an auth.json file")
+
+        raw = load_auth_file(temp_auth)
+        _validate_auth_shape(raw, temp_auth)
+
+        if name is None:
+            name = current_account_display_name() or "default"
+        else:
+            name = _normalize_name(name)
+
+        will_overwrite = account_path(name).exists()
+        dst = account_path(name)
+        shutil.copy2(temp_auth, dst)
+
+    if switch:
+        current = current_account_display_name()
+        if current is not None and current != name:
+            _sync_current_to_saved()
+        live_path = current_auth_path()
+        live_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dst, live_path)
+
+    return dst, will_overwrite
+
+
 def switch_account(name: str) -> Path:
     acct = get_account(name)
     dst_dir = codex_home_dir()
     dst_dir.mkdir(parents=True, exist_ok=True)
+    _sync_current_to_saved()
     shutil.copy2(acct.path, current_auth_path())
     return current_auth_path()
+
+
+def _sync_current_to_saved() -> None:
+    """Sync the live auth.json back to its matching saved profile.
+
+    Codex CLI auto-refreshes tokens in ~/.codex/auth.json.  Without this
+    sync, those refreshed tokens are lost when switching to another account
+    because the saved profile still holds the old snapshot.
+    """
+    live_path = current_auth_path()
+    if not live_path.exists():
+        return
+    current_name = identify_current_account()
+    if current_name is None:
+        return
+    saved_path = account_path(current_name)
+    if saved_path.exists():
+        shutil.copy2(live_path, saved_path)
 
 
 def refresh_account(name: str | None) -> tuple[list[Path], dict[str, Any]]:

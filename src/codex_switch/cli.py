@@ -9,6 +9,7 @@ from typing import Any
 from . import __version__
 from .accounts import (
     AccountError,
+    StoredAccount,
     add_account,
     account_path,
     current_account_display_name,
@@ -17,6 +18,7 @@ from .accounts import (
     get_account,
     identify_current_account,
     list_accounts,
+    login_account,
     remove_account,
     refresh_account,
     rename_account,
@@ -64,6 +66,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_save(args.name)
         if command == "add":
             return cmd_add(args.path, args.name)
+        if command == "login":
+            return cmd_login(args.name, args.device, args.switch)
         if command in ("remove", "rm"):
             return cmd_remove(args.name)
         if command in ("rename", "mv"):
@@ -111,6 +115,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_parser.add_argument("path", help="Path to auth.json file")
     add_parser.add_argument("name", help="Name for the imported account")
 
+    login_parser = subparsers.add_parser("login", help="Log in via Codex CLI and save as a named account")
+    login_parser.add_argument("name", nargs="?", help="Name for the saved account (default: current account name or 'default')")
+    login_parser.add_argument("--device", action="store_true", help="Use device code auth (headless)")
+    login_parser.add_argument("--switch", action="store_true", help="Switch to this account after login")
+
     remove_parser = subparsers.add_parser("remove", aliases=["rm"], help="Remove a saved account")
     remove_parser.add_argument("name", help="Account name to remove")
 
@@ -132,7 +141,7 @@ def cmd_list() -> int:
     # Pass 1: collect static info (offline JWT parsing, fast) to compute column widths
     static_rows: list[list[str]] = []
     for account in accounts:
-        info = _safe_auth_summary(account.path)
+        info = _safe_auth_summary(_effective_path(account, active))
         marker = "*" if active == account.name else " "
         static_rows.append(
             [
@@ -160,8 +169,9 @@ def cmd_list() -> int:
 
     # Pass 2: query quota per account and print each row immediately
     for account, static in zip(accounts, static_rows):
-        info = _safe_auth_summary(account.path)
-        live = _safe_quota(account.path)
+        auth_path = _effective_path(account, active)
+        info = _safe_auth_summary(auth_path)
+        live = _safe_quota(auth_path)
         marker = _color("*", GREEN) if active == account.name else " "
         row = [
             marker,
@@ -278,9 +288,12 @@ def cmd_validate(name: str | None) -> int:
             print("No saved accounts found.")
             return 0
 
+    active = identify_current_account()
+
     for index, account in enumerate(targets):
-        info = _safe_auth_summary(account.path)
-        live = _safe_quota(account.path)
+        auth_path = _effective_path(account, active)
+        info = _safe_auth_summary(auth_path)
+        live = _safe_quota(auth_path)
         if index:
             print("")
         print(f"{BOLD}{account.name}{RESET}")
@@ -325,6 +338,19 @@ def cmd_add(path: str, name: str) -> int:
     return 0
 
 
+def cmd_login(name: str | None, device: bool, switch: bool) -> int:
+    method = "device auth" if device else "browser OAuth"
+    print(f"{BOLD}Logging in via Codex CLI ({method})...{RESET}")
+    dst, will_overwrite = login_account(name, device_auth=device, switch=switch)
+    if will_overwrite:
+        print(_color(f"Warning: overwrote existing account '{dst.stem}'", YELLOW))
+    print(_color(f"Login successful, saved as '{dst.stem}'", GREEN))
+    print(dst)
+    if switch:
+        print(_color(f"Switched to account '{dst.stem}'", GREEN))
+    return 0
+
+
 def cmd_remove(name: str) -> int:
     path = remove_account(name)
     print(_color(f"Removed account '{name}'", GREEN))
@@ -348,6 +374,15 @@ def _resolve_target(name: str | None) -> tuple[str, Path]:
     if not path.exists():
         raise AccountError(f"Current auth file does not exist: {path}")
     return current_account_display_name() or "current", path
+
+
+def _effective_path(account: StoredAccount, active: str | None) -> Path:
+    """Prefer the live auth file for the active account; saved profile otherwise."""
+    if active == account.name:
+        live = current_auth_path()
+        if live.exists():
+            return live
+    return account.path
 
 
 def _safe_auth_summary(path: Path) -> TokenInfo | Exception:
@@ -427,7 +462,7 @@ def _credits_brief(quota: Any) -> str:
 def _format_reset(epoch: int | None) -> str:
     if epoch is None:
         return "-"
-    return datetime.fromtimestamp(epoch).strftime("%m-%d %H:%M")
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%m-%d %H:%M")
 
 
 def _token_cell(expired: bool | None) -> str:
@@ -439,7 +474,7 @@ def _token_cell(expired: bool | None) -> str:
 def _access_exp_cell(expired: bool | None, epoch: int | None) -> str:
     if epoch is None:
         return "-"
-    label = datetime.fromtimestamp(epoch).strftime("%m-%d %H:%M")
+    label = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%m-%d %H:%M")
     if expired:
         return _color(label, RED)
     return _color(label, GREEN)
